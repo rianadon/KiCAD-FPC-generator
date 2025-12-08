@@ -256,10 +256,11 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
         if not prims:
             continue
         start_pos = (prims[0].start_pos[0], prims[0].start_pos[1]) # make a copy
+        end_pos = (prims[-1].end_pos[0], prims[-1].end_pos[1]) # make a copy
         trace_w = trace_widths_top[idx]
         for p in prims:
             p.translate((-start_pos[0], -start_pos[1]))
-        pad = Pad(
+        fp.append(Pad(
             number=idx + 1,
             type=Pad.TYPE_SMT,
             shape=Pad.SHAPE_CUSTOM,
@@ -267,18 +268,27 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
             size=[trace_w, trace_w],
             layers=["F.Cu"],
             primitives=prims,
-        )
-        fp.append(pad)
+        ))
+        fp.append(Pad(
+            number=idx + 1,
+            type=Pad.TYPE_SMT,
+            shape=Pad.SHAPE_CIRCLE,
+            at=end_pos,
+            size=[trace_w, trace_w],
+            layers=["F.Cu"],
+        ))
+
 
     # assemble bottom pads
     for idx, prims in enumerate(trace_prims_bot):
         if not prims:
             continue
         start_pos = (prims[0].start_pos[0], prims[0].start_pos[1]) # make a copy
+        end_pos = (prims[-1].end_pos[0], prims[-1].end_pos[1]) # make a copy
         trace_w = trace_widths_bot[idx]
         for p in prims:
             p.translate((-start_pos[0], -start_pos[1]))
-        pad = Pad(
+        fp.append(Pad(
             number=idx + 1 + len(trace_prims_top),
             type=Pad.TYPE_SMT,
             shape=Pad.SHAPE_CUSTOM,
@@ -286,8 +296,15 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
             size=[trace_w, trace_w],
             layers=["B.Cu"],
             primitives=prims,
-        )
-        fp.append(pad)
+        ))
+        fp.append(Pad(
+            number=idx + 1 + len(trace_prims_top),
+            type=Pad.TYPE_SMT,
+            shape=Pad.SHAPE_CIRCLE,
+            at=end_pos,
+            size=[trace_w, trace_w],
+            layers=["B.Cu"],
+        ))
 
     # texts
     fp.append(
@@ -309,6 +326,140 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
         )
     )
 
+    try:
+        KicadFileHandler(fp).writeFile(filename)
+        print(f"--- Done: '{filename}' ---")
+    except (IOError, PermissionError) as e:
+        print(f"Error saving file '{filename}': {e}", file=sys.stderr)
+
+def generate_joiner(
+    filename: str,
+    left_top: Cable|None,
+    right_top: Cable|None,
+    left_bot: Cable|None,
+    right_bot: Cable|None,
+    length: float,
+):
+    """Generate a tapered joiner footprint between two FPC cables (top + bottom layers)."""
+    print(f"--- Generating Joiner --- Target: {filename}")
+
+    if (left_top is None) != (right_top is None):
+        raise ValueError('If top cable specified, both left and right must be set')
+    if (left_bot is None) != (right_bot is None):
+        raise ValueError('If bottom cable specified, both left and right must be set')
+    if left_top is None and left_bot is None:
+        raise ValueError('At least one of cable_top and cable_bot must be specified')
+
+    left_top = left_top or Cable(left_bot.total_width)
+    left_bot = left_bot or Cable(left_top.total_width)
+    right_top = right_top or Cable(right_bot.total_width)
+    right_bot = right_bot or Cable(right_top.total_width)
+
+    if abs(left_top.total_width - left_bot.total_width) > 1e-3:
+        raise ValueError('Left top and bottom cables must have equal widths')
+    if abs(right_top.total_width - right_bot.total_width) > 1e-3:
+        raise ValueError('Right top and bottom cables must have equal widths')
+
+    if left_top.trace_count != right_top.trace_count:
+        raise ValueError("Top cables must have matching trace counts.")
+    if left_bot.trace_count != right_bot.trace_count:
+        raise ValueError("Bottom cables must have matching trace counts.")
+
+    fp_name = filename.split("/")[-1].split("\\")[-1].replace(".kicad_mod", "")
+    fp = Footprint(fp_name)
+    fp.setDescription(
+        f"Joiner between (top {left_top}->{right_top}) and (bot {left_bot}->{right_bot})"
+    )
+    fp.setTags("fpc joiner taper dual")
+
+    # --- Geometry setup ---
+    left_top_offsets, left_top_widths = left_top.trace_details()
+    right_top_offsets, right_top_widths = right_top.trace_details()
+    left_bot_offsets, left_bot_widths = left_bot.trace_details()
+    right_bot_offsets, right_bot_widths = right_bot.trace_details()
+
+    left_edge_offsets, left_edge_width = left_top.edge_details()
+    right_edge_offsets, right_edge_width = right_top.edge_details()
+    start_pos, end_pos = (0.0, 0.0), (length, 0.0)
+    direction, perp = (1.0, 0.0), (0.0, -1.0)
+
+    # Edge lines (single set)
+    for l_off, r_off in zip(left_edge_offsets, right_edge_offsets):
+        s = vec_add(start_pos, vec_scale(perp, l_off))
+        e = vec_add(end_pos, vec_scale(perp, r_off))
+        fp.append(Line(start=s, end=e, width=left_edge_width, layer="Edge.Cuts"))
+
+    # --- Helper for one layer ---
+    def make_layer(left: Cable, right: Cable, layer: str, start = 0):
+        left_offsets, left_widths = left.trace_details()
+        right_offsets, right_widths = right.trace_details()
+
+        for idx in range(left.trace_count):
+            l_off, l_w = left_offsets[idx], left_widths[idx]
+            r_off, r_w = right_offsets[idx], right_widths[idx]
+
+            big_w, small_w = (l_w, r_w) if l_w >= r_w else (r_w, l_w)
+            num_lines = math.ceil(big_w / small_w)
+            prims = []
+
+            for i in range(num_lines):
+                t = i / (num_lines - 1) if num_lines > 1 else 0.0
+                offset_side = (t-0.5) * (big_w - small_w)
+                start_center = vec_add(start_pos, vec_scale(perp, l_off))
+                end_center = vec_add(end_pos, vec_scale(perp, r_off))
+                s = vec_add(start_center, vec_scale(perp, offset_side))
+                e = end_center
+                prims.append(Line(start=s, end=e, width=small_w, layer=layer))
+
+            # Translate primitives so they’re relative to left cable’s center
+            base = vec_add(start_pos, vec_scale(perp, l_off))
+            for p in prims:
+                p.translate((-base[0], -base[1]))
+
+            fp.append(Pad(
+                number=idx + start + 1,
+                type=Pad.TYPE_SMT,
+                shape=Pad.SHAPE_CUSTOM,
+                at=base,
+                size=[l_w, l_w],
+                layers=[layer],
+                primitives=prims,
+            ))
+            fp.append(Pad(
+                number=idx + start + 1,
+                type=Pad.TYPE_SMT,
+                shape=Pad.SHAPE_CIRCLE,
+                at=vec_add(end_pos, vec_scale(perp, r_off)),
+                size=[r_w, r_w],
+                layers=[layer],
+            ))
+
+    # --- Generate both layers ---
+    make_layer(left_top, right_top, "F.Cu")
+    make_layer(left_bot, right_bot, "B.Cu", left_top.trace_count)
+
+    # --- Texts ---
+    total_w = max(left_top.total_width, left_bot.total_width)
+    fp.append(
+        Text(
+            type="reference",
+            text="REF**",
+            at=[0, -total_w],
+            layer="F.SilkS",
+            effects={"font": {"size": [1, 1], "thickness": 0.15}},
+        )
+    )
+    fp.append(
+        Text(
+            type="value",
+            text=fp_name,
+            at=[0, total_w + 1],
+            layer="F.Fab",
+            effects={"font": {"size": [1, 1], "thickness": 0.15}},
+        )
+    )
+
+    # --- Write file ---
     try:
         KicadFileHandler(fp).writeFile(filename)
         print(f"--- Done: '{filename}' ---")
