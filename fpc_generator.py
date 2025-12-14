@@ -74,31 +74,25 @@ class Cable:
         # cw detection via 2D cross product
         cross = from_dir[0] * to_dir[1] - from_dir[1] * to_dir[0]
         is_cw = cross > 0
-        perp_from = get_perp_vec(from_dir)
+        n_from = get_perp_vec(from_dir)
+        n_to   = get_perp_vec(to_dir)
 
-        # compute center-line arc_center and end like original logic (kept compact)
         if is_cw:
-            arc_center = vec_add(
-                center_start, (to_dir[0] * radius, from_dir[0] * radius)
-            )
-            center_end = vec_add(arc_center, (to_dir[1] * radius, -to_dir[0] * radius))
+            arc_center = vec_add(center_start, (radius * n_from[0], radius * n_from[1]))
+            center_end = vec_add(arc_center, (-radius * n_to[0], -radius * n_to[1]))
         else:
-            arc_center = vec_add(
-                center_start, (from_dir[1] * radius, to_dir[1] * radius)
-            )
-            center_end = vec_add(arc_center, (-to_dir[1] * radius, to_dir[0] * radius))
+            arc_center = vec_add(center_start, (-radius * n_from[0], -radius * n_from[1]))
+            center_end = vec_add(arc_center, (radius * n_to[0], radius * n_to[1]))
 
         def _arc_for_offset(off, w):
-            start_pos = vec_add(center_start, vec_scale(perp_from, off))
+            start_pos = vec_add(center_start, vec_scale(n_from, off))
             if is_cw:
                 r_trace = radius - off
-                arc_c = vec_add(start_pos, (to_dir[0] * r_trace, from_dir[0] * r_trace))
-                end_pos = vec_add(arc_c, (to_dir[1] * r_trace, -to_dir[0] * r_trace))
+                end_pos = vec_add(arc_center, (to_dir[1] * r_trace, -to_dir[0] * r_trace))
             else:
                 r_trace = radius + off
-                arc_c = vec_add(start_pos, (from_dir[1] * r_trace, to_dir[1] * r_trace))
-                end_pos = vec_add(arc_c, (-to_dir[1] * r_trace, to_dir[0] * r_trace))
-            return Arc(center=arc_c, start=start_pos, end=end_pos, width=w, layer=layer)
+                end_pos = vec_add(arc_center, (-to_dir[1] * r_trace, to_dir[0] * r_trace))
+            return Arc(center=arc_center, start=start_pos, end=end_pos, width=w, layer=layer)
 
         # widths may be scalar or list
         if isinstance(widths, (int, float)):
@@ -115,27 +109,29 @@ class Cable:
 class Segment:
     length: float
     vec: tuple[float, float]
+    hasedge: bool = True
 
 
 @dataclass(frozen=True)
 class Curve:
     r: float
+    hasedge: bool = True
 
-def Right(length: float):
-    return Segment(length, (1.0, 0.0))
+def Right(length: float, hasedge=True):
+    return Segment(length, (1.0, 0.0), hasedge)
 
-def Left(length: float):
-    return Segment(length, (-1.0, 0.0))
+def Left(length: float, hasedge=True):
+    return Segment(length, (-1.0, 0.0), hasedge)
 
-def Down(length: float):
-    return Segment(length, (0.0, 1.0))
+def Down(length: float, hasedge=True):
+    return Segment(length, (0.0, 1.0), hasedge)
 
-def Up(length: float):
-    return Segment(length, (0.0, -1.0))
+def Up(length: float, hasedge=True):
+    return Segment(length, (0.0, -1.0), hasedge)
 
-def Angle(length: float, angle: float):
+def Angle(length: float, angle: float, hasedge=True):
     rad = math.radians(angle)
-    return Segment(length, (math.cos(rad), math.sin(rad)))
+    return Segment(length, (math.cos(rad), math.sin(rad)), hasedge)
 
 
 def get_perp_vec(direction: Vec2D) -> Vec2D:
@@ -144,13 +140,13 @@ def get_perp_vec(direction: Vec2D) -> Vec2D:
 
 def vec_add(a: Vec2D, b: Vec2D) -> Vec2D:
     return (a[0] + b[0], a[1] + b[1])
-
-
+def vec_sub(a: Vec2D, b: Vec2D) -> Vec2D:
+    return (a[0] - b[0], a[1] - b[1])
 def vec_scale(v: Vec2D, s: float) -> Vec2D:
     return (v[0] * s, v[1] * s)
 
 
-def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | None, sections: Sequence):
+def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | None, sections: Sequence, start_x=0, start_y=0):
     print(f"--- Generating KiCad Mod --- Target: {filename}")
     try:
         fp_name = filename.split("/")[-1].split("\\")[-1].replace(".kicad_mod", "")
@@ -179,7 +175,7 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
     trace_prims_top: List[List] = [[] for _ in range(cable_top.trace_count)]
     trace_prims_bot: List[List] = [[] for _ in range(cable_bot.trace_count)]
 
-    center_pos: Vec2D = (0.0, 0.0)
+    center_pos: Vec2D = (start_x, start_y)
     current_dir = None
 
     i = 0
@@ -189,27 +185,29 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
             d = seg.vec
             length = seg.length
             center_end = vec_add(center_pos, vec_scale(d, length))
-            perp = get_perp_vec(d)
+            if length > 0:
+                perp = get_perp_vec(d)
 
-            # shared Edge.Cuts lines
-            for off in edge_offsets:
-                s = vec_add(center_pos, vec_scale(perp, off))
-                e = vec_add(center_end, vec_scale(perp, off))
-                fp.append(Line(start=s, end=e, width=edge_width, layer="Edge.Cuts"))
+                # shared Edge.Cuts lines
+                if seg.hasedge:
+                    for off in edge_offsets:
+                        s = vec_add(center_pos, vec_scale(perp, off))
+                        e = vec_add(center_end, vec_scale(perp, off))
+                        fp.append(Line(start=s, end=e, width=edge_width, layer="Edge.Cuts"))
 
-            # top traces
-            for idx in range(len(trace_prims_top)):
-                off, w = trace_offsets_top[idx], trace_widths_top[idx]
-                s = vec_add(center_pos, vec_scale(perp, off))
-                e = vec_add(center_end, vec_scale(perp, off))
-                trace_prims_top[idx].append(Line(start=s, end=e, width=w))
+                # top traces
+                for idx in range(len(trace_prims_top)):
+                    off, w = trace_offsets_top[idx], trace_widths_top[idx]
+                    s = vec_add(center_pos, vec_scale(perp, off))
+                    e = vec_add(center_end, vec_scale(perp, off))
+                    trace_prims_top[idx].append(Line(start=s, end=e, width=w))
 
-            # bottom traces
-            for idx in range(len(trace_prims_bot)):
-                off, w = trace_offsets_bot[idx], trace_widths_bot[idx]
-                s = vec_add(center_pos, vec_scale(perp, off))
-                e = vec_add(center_end, vec_scale(perp, off))
-                trace_prims_bot[idx].append(Line(start=s, end=e, width=w))
+                # bottom traces
+                for idx in range(len(trace_prims_bot)):
+                    off, w = trace_offsets_bot[idx], trace_widths_bot[idx]
+                    s = vec_add(center_pos, vec_scale(perp, off))
+                    e = vec_add(center_end, vec_scale(perp, off))
+                    trace_prims_bot[idx].append(Line(start=s, end=e, width=w))
 
             center_pos, current_dir = center_end, d
             i += 1
@@ -228,8 +226,9 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
             edge_arcs, center_end = cable_top.arc_primitives(
                 center_pos, seg.r, current_dir, next_dir, edge_offsets, edge_width, "Edge.Cuts"
             )
-            for a in edge_arcs:
-                fp.append(a)
+            if seg.hasedge:
+                for a in edge_arcs:
+                    fp.append(a)
 
             # top traces
             trace_arcs_top, _ = cable_top.arc_primitives(
@@ -256,7 +255,8 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
         if not prims:
             continue
         start_pos = (prims[0].start_pos[0], prims[0].start_pos[1]) # make a copy
-        end_pos = (prims[-1].end_pos[0], prims[-1].end_pos[1]) # make a copy
+        end_pos = prims[-1].end_pos if isinstance(prims[-1], Line) else prims[-1].getEndPoint()
+        end_pos = (end_pos[0], end_pos[1]) # make a copy
         trace_w = trace_widths_top[idx]
         for p in prims:
             p.translate((-start_pos[0], -start_pos[1]))
@@ -284,7 +284,8 @@ def generate_cable(filename: str, cable_top: Cable | None, cable_bot: Cable | No
         if not prims:
             continue
         start_pos = (prims[0].start_pos[0], prims[0].start_pos[1]) # make a copy
-        end_pos = (prims[-1].end_pos[0], prims[-1].end_pos[1]) # make a copy
+        end_pos = prims[-1].end_pos if isinstance(prims[-1], Line) else prims[-1].getEndPoint()
+        end_pos = (end_pos[0], end_pos[1]) # make a copy
         trace_w = trace_widths_bot[idx]
         for p in prims:
             p.translate((-start_pos[0], -start_pos[1]))
